@@ -29,6 +29,26 @@ test('README documents Pi write registration separately from read-only execution
   expect(readme).not.toContain('and `CONFLUENCE_READ_ONLY` is false, Pi also registers');
 });
 
+test('documents the opt-in bulk page manipulation contract', () => {
+  const documents = [
+    fs.readFileSync(path.join(packageRoot, 'README.md'), 'utf8'),
+    fs.readFileSync(path.join(packageRoot, 'plugins/confluence/skills/confluence/SKILL.md'), 'utf8'),
+  ];
+
+  for (const document of documents) {
+    expect(document).toContain('CONFLUENCE_PI_BULK_PAGE_MANIPULATION=true');
+    expect(document).toContain('confluence_pages_manipulate');
+    expect(document).toContain('`create`, `create-child`, `update`, `move`, and `delete`');
+    expect(document).toContain('MANIPULATE <count> ACTIONS: <canonicalTargetId,...>');
+    expect(document).toContain('one confirmation');
+    expect(document).toContain('three retries');
+    expect(document).toContain('continue with later actions');
+    expect(document).toContain('`UNKNOWN_RESULT` actions are not retried');
+    expect(document).not.toContain('CONFLUENCE_PI_BULK_PAGE_DELETE');
+    expect(document).not.toContain('confluence_pages_delete');
+  }
+});
+
 test('includes Pi resources in the npm package tarball', () => {
   const packed = JSON.parse(execFileSync('npm', ['pack', '--dry-run', '--json'], {
     cwd: packageRoot,

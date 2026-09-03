@@ -25,7 +25,21 @@ When running in Pi, use the typed Confluence tools for supported operations inst
 
 Pi read tools are: `confluence_read`, `confluence_search`, `confluence_info`, `confluence_spaces`, `confluence_children`, `confluence_export`, `confluence_convert`, `confluence_find`, `confluence_versions`, `confluence_comments`, `confluence_attachments`, `confluence_property_list`, and `confluence_property_get`.
 
-Protected mutation tools are registered only when the operator starts Pi with writes enabled and an allowed-space list. They are: `confluence_create`, `confluence_create_child`, `confluence_update`, `confluence_move`, `confluence_delete`, `confluence_copy_tree_preview`, `confluence_copy_tree`, `confluence_comment_create`, `confluence_comment_delete`, `confluence_property_set`, `confluence_property_delete`, `confluence_attachment_upload`, `confluence_attachment_delete`, `confluence_version_delete`, `confluence_versions_purge_preview`, and `confluence_versions_purge`.
+Protected mutation tools are registered only when the operator starts Pi with writes enabled and an allowed-space list. They are: `confluence_create`, `confluence_create_child`, `confluence_update`, `confluence_move`, `confluence_delete`, `confluence_copy_tree_preview`, `confluence_copy_tree`, `confluence_comment_create`, `confluence_comment_delete`, `confluence_property_set`, `confluence_property_delete`, `confluence_attachment_upload`, `confluence_attachment_delete`, `confluence_version_delete`, `confluence_versions_purge_preview`, and `confluence_versions_purge`. `confluence_pages_manipulate` is additionally registered only when `CONFLUENCE_PI_BULK_PAGE_MANIPULATION=true`.
+
+`confluence_pages_manipulate` accepts one non-empty `actions` list of page-level `create`, `create-child`, `update`, `move`, and `delete` operations:
+
+```js
+confluence_pages_manipulate({
+  actions: [
+    { operation: "update", pageId: "123", title: "Release Notes v2" },
+    { operation: "move", pageId: "123", newParentId: "456" },
+    { operation: "delete", pageId: "789" }
+  ]
+})
+```
+
+It preflights every action, displays the complete canonical scope, and requires one confirmation with `MANIPULATE <count> ACTIONS: <canonicalTargetId,...>` before executing actions in input order. Known failures receive three retries (four attempts total); exhausted failures and `UNKNOWN_RESULT` actions are not retried, and both continue with later actions. The final report separates successful, failed, and unknown actions; review it before retrying any partial batch.
 
 Before requesting any mutation, identify the affected page title and ID in your request or summary. Existing-page confirmations include canonical title, ID, and space from preflight. Never claim confirmation on the user's behalf and never type a destructive confirmation phrase unless the user has explicitly instructed that exact operation. Preview `confluence_copy_tree_preview` and `confluence_versions_purge_preview` before asking the user to execute `confluence_copy_tree` or `confluence_versions_purge`; execution accepts only the one-use approval ID returned by preview. Each approval expires after five minutes, is consumed once, and requires a fresh preview if it is stale, used, or expired.
 

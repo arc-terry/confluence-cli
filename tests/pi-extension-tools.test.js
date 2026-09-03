@@ -23,6 +23,7 @@ const BULK_WRITE_TOOLS = [
   'confluence_copy_tree_preview', 'confluence_copy_tree',
   'confluence_versions_purge_preview', 'confluence_versions_purge',
 ];
+const PAGE_MANIPULATION_TOOL = 'confluence_pages_manipulate';
 
 const VALID_WRITE_ENV = Object.freeze({
   CONFLUENCE_PI_WRITES: 'true',
@@ -38,13 +39,15 @@ import { createJiti } from 'jiti';
 const scenario = JSON.parse(process.env.PI_EXTENSION_SCENARIO || '{}');
 const ordinaryWriteTools = new Set(${JSON.stringify(ORDINARY_WRITE_TOOLS)});
 const bulkWriteTools = new Set(${JSON.stringify(BULK_WRITE_TOOLS)});
-const allWriteTools = new Set([...ordinaryWriteTools, ...bulkWriteTools]);
+const allWriteTools = new Set([...ordinaryWriteTools, ...bulkWriteTools, ${JSON.stringify(PAGE_MANIPULATION_TOOL)}]);
 const events = [];
 const calls = [];
 const env = { ...(scenario.env || {}) };
 const cwd = scenario.cwd || process.cwd();
 let currentStep = scenario;
 let nowValue = scenario.now ?? 1000;
+const mutationFailures = { ...(scenario.mutationFailures || {}) };
+let activeController;
 
 function setting(name, fallback) {
   if (currentStep && Object.prototype.hasOwnProperty.call(currentStep, name)) return currentStep[name];
@@ -184,9 +187,16 @@ async function runCommand(options) {
   }
 
   events.push('mutation:' + info.toolName + ':' + info.id);
-  if (setting('mutationFails')) {
+  const mutationFailureKey = info.toolName + ':' + info.id;
+  const configuredFailure = mutationFailures[mutationFailureKey];
+  const mutationFailure = Array.isArray(configuredFailure)
+    ? configuredFailure.shift()
+    : typeof configuredFailure === 'number' && configuredFailure > 0
+      ? (mutationFailures[mutationFailureKey] -= 1, {})
+      : configuredFailure;
+  if (mutationFailure || setting('mutationFails')) {
     const error = new Error('Confluence CLI failed: token=' + setting('secret') + ' server rejected update');
-    error.code = setting('mutationErrorCode', 'CLI_FAILED');
+    error.code = mutationFailure?.code || setting('mutationErrorCode', 'CLI_FAILED');
     error.unknownResult = error.code === 'UNKNOWN_RESULT';
     error.stdout = '{"error":"token=' + setting('secret') + ' stdout failure"}';
     error.stderr = 'token=' + setting('secret') + ' stderr failure';
@@ -194,6 +204,9 @@ async function runCommand(options) {
     throw error;
   }
   const json = { ok: true, argv: options.args };
+  if (options.mutation && setting('abortAfterFirstMutation') && events.filter((event) => event.startsWith('mutation:')).length === 1) {
+    activeController.abort();
+  }
   return { stdout: JSON.stringify(json), stderr: 'mutation stderr', truncated: false, json };
 }
 
@@ -240,6 +253,7 @@ async function executeStep(step, index, previousResult) {
   nowValue = step.now ?? nowValue;
   const tool = tools.find((candidate) => candidate.name === step.toolName);
   const controller = new AbortController();
+  activeController = controller;
   if (setting('abortBeforeExecute')) controller.abort();
   const ctx = {
     cwd,
@@ -273,6 +287,7 @@ process.stdout.write(JSON.stringify({
   schemaDetails: {
     commentLocations: extensionModule.WRITE_TOOL_SCHEMAS.confluence_comment_create.properties.location.enum,
     attachmentFilesMaxItems: extensionModule.WRITE_TOOL_SCHEMAS.confluence_attachment_upload.properties.files.maxItems ?? null,
+    pageManipulation: extensionModule.WRITE_TOOL_SCHEMAS.confluence_pages_manipulate,
   },
   events,
   calls,
@@ -309,7 +324,7 @@ test('registers exactly thirteen working read tools when writes are not enabled'
   const output = runHarness({ env: { CONFLUENCE_PI_WRITES: '', CONFLUENCE_PI_WRITE_SPACES: '' } });
 
   expect(output.registered).toEqual(READ_TOOLS);
-  expect(output.writeSchemas).toHaveLength(16);
+  expect(output.writeSchemas).toHaveLength(17);
   expect(output.registered).not.toContain('confluence_create');
   expect(output.registered).not.toContain('confluence_copy_tree_preview');
 });
@@ -319,7 +334,249 @@ test('registers exactly sixteen write tools only under a valid write gate', () =
 
   expect(output.registered).toEqual([...READ_TOOLS, ...ORDINARY_WRITE_TOOLS, ...BULK_WRITE_TOOLS]);
   expect(output.registered).toHaveLength(29);
-  expect(output.writeSchemas).toHaveLength(16);
+  expect(output.writeSchemas).toHaveLength(17);
+});
+
+test('registers the aggregate page manipulation schema only with its exact opt-in gate', () => {
+  const withoutGate = runHarness({ env: VALID_WRITE_ENV });
+  const withGate = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_PAGE_MANIPULATION: 'true' },
+  });
+  const withTrimmedGate = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_PAGE_MANIPULATION: ' true ' },
+  });
+  const withNonTrueGate = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_PAGE_MANIPULATION: 'false' },
+  });
+  const withLegacyGate = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_PAGE_DELETE: 'true' },
+  });
+
+  expect(withoutGate.registered).not.toContain(PAGE_MANIPULATION_TOOL);
+  expect(withoutGate.registered).not.toContain('confluence_pages_delete');
+  expect(withGate.registered).toContain(PAGE_MANIPULATION_TOOL);
+  expect(withGate.registered).not.toContain('confluence_pages_delete');
+  expect(withGate.writeSchemas).toContain(PAGE_MANIPULATION_TOOL);
+  expect(withGate.writeSchemas).not.toContain('confluence_pages_delete');
+  expect(withTrimmedGate.registered).toContain(PAGE_MANIPULATION_TOOL);
+  expect(withNonTrueGate.registered).not.toContain(PAGE_MANIPULATION_TOOL);
+  expect(withLegacyGate.registered).not.toContain(PAGE_MANIPULATION_TOOL);
+  expect(withLegacyGate.registered).not.toContain('confluence_pages_delete');
+});
+
+test('aggregate page manipulation schema requires five discriminated action variants and a non-empty action list', () => {
+  const output = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_PAGE_MANIPULATION: 'true' },
+  });
+  const actions = output.schemaDetails.pageManipulation.properties.actions;
+
+  expect(actions).toMatchObject({ type: 'array', minItems: 1 });
+  expect(actions.items.anyOf.map((variant) => ({
+    operation: variant.properties.operation.const,
+    required: variant.required,
+  }))).toEqual([
+    { operation: 'create', required: ['operation', 'title', 'spaceKey'] },
+    { operation: 'create-child', required: ['operation', 'title', 'parentId'] },
+    { operation: 'update', required: ['operation', 'pageId'] },
+    { operation: 'move', required: ['operation', 'pageId', 'newParentId'] },
+    { operation: 'delete', required: ['operation', 'pageId'] },
+  ]);
+});
+
+test('page manipulation preflights every mixed action before one typed confirmation and any mutation', () => {
+  const output = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_PAGE_MANIPULATION: 'true' },
+    toolName: 'confluence_pages_manipulate',
+    input: {
+      actions: [
+        { operation: 'update', pageId: '123', title: 'Release Notes v2' },
+        { operation: 'move', pageId: '123', newParentId: '456' },
+        { operation: 'delete', pageId: '789' },
+      ],
+    },
+    recordInputMessage: true,
+  });
+  const preflights = [
+    'preflight:confluence_info:123',
+    'preflight:confluence_info:123',
+    'preflight:confluence_info:456',
+    'preflight:confluence_info:789',
+  ];
+  const mutations = [
+    'mutation:confluence_update:123',
+    'mutation:confluence_move:123',
+    'mutation:confluence_delete:789',
+  ];
+  const confirmations = output.events.filter((event) => event.startsWith('input:'));
+
+  expect(output.error).toBeNull();
+  expect(output.events.filter((event) => event.startsWith('confirm:'))).toHaveLength(0);
+  expect(output.events.filter((event) => event.startsWith('preflight:'))).toEqual(preflights);
+  expect(confirmations).toEqual(['input:Type exactly: MANIPULATE 3 ACTIONS: 123,123,456,789']);
+  expect(output.events.filter((event) => event.startsWith('mutation:'))).toEqual(mutations);
+  expect(output.events.find((event) => event.startsWith('input-message:'))).toContain('Release Notes');
+  expect(output.events.find((event) => event.startsWith('input-message:'))).toContain('Operations Runbooks');
+  expect(Math.max(...preflights.map((event) => output.events.lastIndexOf(event))))
+    .toBeLessThan(output.events.indexOf(confirmations[0]));
+  expect(output.events.indexOf(confirmations[0]))
+    .toBeLessThan(Math.min(...mutations.map((event) => output.events.indexOf(event))));
+});
+
+test('page manipulation runs create and create-child through preflight before one typed confirmation', () => {
+  const output = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_PAGE_MANIPULATION: 'true' },
+    toolName: 'confluence_pages_manipulate',
+    input: {
+      actions: [
+        { operation: 'create', title: 'New Page', spaceKey: 'ENG', content: 'body' },
+        { operation: 'create-child', title: 'Child Page', parentId: '123', content: 'body' },
+      ],
+    },
+    recordInputMessage: true,
+  });
+
+  expect(output.error).toBeNull();
+  expect(output.events.filter((event) => event.startsWith('preflight:'))).toEqual([
+    'preflight:confluence_space_lookup:ENG',
+    'preflight:confluence_info:123',
+  ]);
+  expect(output.events.filter((event) => event.startsWith('input:')))
+    .toEqual(['input:Type exactly: MANIPULATE 2 ACTIONS: ENG,123']);
+  expect(output.events.filter((event) => event.startsWith('mutation:'))).toEqual([
+    'mutation:confluence_create:New Page',
+    'mutation:confluence_create_child:Child Page',
+  ]);
+  expect(output.events.find((event) => event.startsWith('input-message:'))).toContain('Engineering');
+  expect(output.events.find((event) => event.startsWith('input-message:'))).toContain('Release Notes');
+});
+
+test('page manipulation returns the no-mutation result when an action is cancelled', () => {
+  const output = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_PAGE_MANIPULATION: 'true' },
+    toolName: 'confluence_pages_manipulate',
+    input: { actions: [{ operation: 'update', pageId: '123', title: 'Cancelled action' }] },
+    mutationFailures: { 'confluence_update:123': { code: 'CANCELLED' } },
+  });
+
+  expect(output.error).toBeNull();
+  expect(output.result.content[0].text).toContain('No Confluence mutation was started.');
+  expect(output.result.details).toMatchObject({ cancelled: true, code: 'CANCELLED' });
+  expect(output.result.details).not.toHaveProperty('failed');
+});
+
+test('page manipulation reports a partial batch when cancellation follows a success', () => {
+  const output = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_PAGE_MANIPULATION: 'true' },
+    toolName: 'confluence_pages_manipulate',
+    input: { actions: [
+      { operation: 'update', pageId: '123', title: 'Succeeded first' },
+      { operation: 'delete', pageId: '789' },
+    ] },
+    mutationFailures: { 'confluence_delete:789': { code: 'CANCELLED' } },
+  });
+
+  expect(output.error).toBeNull();
+  expect(output.result.details.succeeded.map((item) => item.index)).toEqual([0]);
+  expect(output.result.details.cancelled).toMatchObject({
+    index: 1,
+    operation: 'confluence_delete',
+    error: { code: 'CANCELLED' },
+  });
+  expect(output.result.content[0].text).toContain('Review the action report before retrying.');
+  expect(output.result.content[0].text).not.toContain('No Confluence mutation was started.');
+});
+
+test('page manipulation reports a partial batch when its signal aborts between actions', () => {
+  const output = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_PAGE_MANIPULATION: 'true' },
+    toolName: 'confluence_pages_manipulate',
+    input: { actions: [
+      { operation: 'update', pageId: '123', title: 'Succeeded first' },
+      { operation: 'delete', pageId: '789' },
+    ] },
+    abortAfterFirstMutation: true,
+  });
+
+  expect(output.error).toBeNull();
+  expect(output.events.filter((event) => event.startsWith('mutation:'))).toEqual(['mutation:confluence_update:123']);
+  expect(output.result.details).toMatchObject({
+    succeeded: [expect.objectContaining({ index: 0, operation: 'confluence_update' })],
+    cancelled: expect.objectContaining({ index: 1, operation: 'confluence_delete', error: expect.objectContaining({ code: 'CANCELLED' }) }),
+  });
+  expect(output.result.content[0].text).toContain('Review the action report before retrying.');
+  expect(output.result.content[0].text).not.toContain('No Confluence mutation was started.');
+});
+
+test('retries a known page-action failure three times and continues later actions', () => {
+  const output = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_PAGE_MANIPULATION: 'true' },
+    toolName: 'confluence_pages_manipulate',
+    input: { actions: [
+      { operation: 'update', pageId: '123', title: 'Retry me' },
+      { operation: 'delete', pageId: '789' },
+    ] },
+    mutationFailures: { 'confluence_update:123': 3 },
+  });
+
+  expect(output.error).toBeNull();
+  expect(output.events.filter((event) => event.startsWith('mutation:confluence_update:123'))).toHaveLength(4);
+  expect(output.events).toContain('mutation:confluence_delete:789');
+  expect(output.result.details.failed).toEqual([]);
+  expect(output.result.details.succeeded.map((item) => item.index)).toEqual([0, 1]);
+});
+
+test('does not retry unknown mutation results and continues later actions', () => {
+  const output = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_PAGE_MANIPULATION: 'true' },
+    toolName: 'confluence_pages_manipulate',
+    input: { actions: [
+      { operation: 'update', pageId: '123', title: 'Unknown result' },
+      { operation: 'delete', pageId: '789' },
+    ] },
+    mutationFailures: { 'confluence_update:123': { code: 'UNKNOWN_RESULT' } },
+  });
+
+  expect(output.error).toBeNull();
+  expect(output.events.filter((event) => event.startsWith('mutation:confluence_update:123'))).toHaveLength(1);
+  expect(output.events).toContain('mutation:confluence_delete:789');
+  expect(output.result.details.unknown.map((item) => item.index)).toEqual([0]);
+});
+
+test('reports exhausted failures without hiding earlier successful actions', () => {
+  const output = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_PAGE_MANIPULATION: 'true' },
+    toolName: 'confluence_pages_manipulate',
+    input: { actions: [
+      { operation: 'update', pageId: '123', title: 'Succeeded first' },
+      { operation: 'delete', pageId: '789' },
+      { operation: 'delete', pageId: '456' },
+    ] },
+    mutationFailures: { 'confluence_delete:789': 4 },
+  });
+
+  expect(output.error).toBeNull();
+  expect(output.events.filter((event) => event.startsWith('mutation:confluence_delete:789'))).toHaveLength(4);
+  expect(output.events).toContain('mutation:confluence_delete:456');
+  expect(output.result.details.succeeded.map((item) => item.index)).toEqual([0, 2]);
+  expect(output.result.details.failed.map((item) => item.index)).toEqual([1]);
+  expect(output.result.content[0].text).toContain('Earlier actions may already have succeeded.');
+});
+
+test('page manipulation rejects duplicate canonical IDs among delete actions', () => {
+  const output = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_PAGE_MANIPULATION: 'true' },
+    toolName: 'confluence_pages_manipulate',
+    input: {
+      actions: [
+        { operation: 'delete', pageId: '123' },
+        { operation: 'delete', pageId: 'https://example.atlassian.net/wiki/pages/123/Release-Notes' },
+      ],
+    },
+  });
+
+  expect(output.error).toMatchObject({ code: 'INVALID_PAGE_IDS' });
+  expect(output.events.filter((event) => event.startsWith('input:'))).toHaveLength(0);
+  expect(hasMutation(output)).toBe(false);
 });
 
 test('write schemas match real CLI location values and defer attachment count to runtime limits', () => {

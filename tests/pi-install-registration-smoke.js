@@ -63,10 +63,13 @@ function inventory(extensionModule, extensionEnv) {
       CONFLUENCE_PI_WRITES: 'true',
       CONFLUENCE_PI_WRITE_SPACES: 'ENG',
       CONFLUENCE_PI_MAX_BODY_BYTES: 'invalid',
+      CONFLUENCE_PI_BULK_PAGE_MANIPULATION: 'true',
     });
 
     assert.equal(readOnly.length, 13);
-    assert.equal(protectedWrites.length, 29);
+    assert.equal(protectedWrites.length, 30);
+    assert.ok(protectedWrites.includes('confluence_pages_manipulate'));
+    assert.ok(!protectedWrites.includes('confluence_pages_delete'));
     assert.ok(!protectedWrites.includes('confluence_api'));
     process.stdout.write(`${JSON.stringify({ installed: true, readTools: readOnly.length, protectedTools: protectedWrites.length, apiEscape: false })}\n`);
   } finally {

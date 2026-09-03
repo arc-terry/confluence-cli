@@ -80,7 +80,21 @@ Write tool registration depends only on `CONFLUENCE_PI_WRITES=true` plus a valid
 
 Pi read tools are: `confluence_read`, `confluence_search`, `confluence_info`, `confluence_spaces`, `confluence_children`, `confluence_export`, `confluence_convert`, `confluence_find`, `confluence_versions`, `confluence_comments`, `confluence_attachments`, `confluence_property_list`, and `confluence_property_get`.
 
-When `CONFLUENCE_PI_WRITES=true` and `CONFLUENCE_PI_WRITE_SPACES` is a non-empty comma-separated allowlist without wildcards, Pi also registers these protected mutation tools: `confluence_create`, `confluence_create_child`, `confluence_update`, `confluence_move`, `confluence_delete`, `confluence_copy_tree_preview`, `confluence_copy_tree`, `confluence_comment_create`, `confluence_comment_delete`, `confluence_property_set`, `confluence_property_delete`, `confluence_attachment_upload`, `confluence_attachment_delete`, `confluence_version_delete`, `confluence_versions_purge_preview`, and `confluence_versions_purge`.
+When `CONFLUENCE_PI_WRITES=true` and `CONFLUENCE_PI_WRITE_SPACES` is a non-empty comma-separated allowlist without wildcards, Pi also registers these protected mutation tools: `confluence_create`, `confluence_create_child`, `confluence_update`, `confluence_move`, `confluence_delete`, `confluence_copy_tree_preview`, `confluence_copy_tree`, `confluence_comment_create`, `confluence_comment_delete`, `confluence_property_set`, `confluence_property_delete`, `confluence_attachment_upload`, `confluence_attachment_delete`, `confluence_version_delete`, `confluence_versions_purge_preview`, and `confluence_versions_purge`. Set `CONFLUENCE_PI_BULK_PAGE_MANIPULATION=true` to additionally register `confluence_pages_manipulate`.
+
+`confluence_pages_manipulate` accepts one non-empty `actions` list of page-level `create`, `create-child`, `update`, `move`, and `delete` operations:
+
+```js
+confluence_pages_manipulate({
+  actions: [
+    { operation: "update", pageId: "123", title: "Release Notes v2" },
+    { operation: "move", pageId: "123", newParentId: "456" },
+    { operation: "delete", pageId: "789" }
+  ]
+})
+```
+
+The tool preflights every action, displays the complete canonical scope, and requires one confirmation with `MANIPULATE <count> ACTIONS: <canonicalTargetId,...>` before executing actions in input order. Known failures receive three retries (four attempts total); exhausted failures and `UNKNOWN_RESULT` actions are not retried, and both continue with later actions. Its final report separates successful, failed, and unknown actions; review it before retrying any partial batch.
 
 The generic API escape hatch remains unavailable: this package does not register `confluence_api` or any `api`, `argv`, or raw HTTP method tool. Use the typed tools above rather than model-controlled Bash for supported Confluence operations.
 
@@ -96,7 +110,7 @@ Destructive writes require exact phrases in the confirmation UI:
 - Copy-tree execution: `COPY <count> PAGES FROM <sourcePageId> TO <targetParentId>`
 - Versions purge execution: `PURGE <count> VERSIONS FROM <pageId>`
 
-Bulk operations must be previewed before execution. `confluence_copy_tree_preview` and `confluence_versions_purge_preview` return a one-use approval ID that expires after five minutes (`300000` ms). The execution tools accept only `{ "approvalId": "..." }`; if an approval expires, is stale, or has been used, run a new preview.
+Copy-tree and version-purge operations must be previewed before execution. `confluence_copy_tree_preview` and `confluence_versions_purge_preview` return a one-use approval ID that expires after five minutes (`300000` ms). The execution tools accept only `{ "approvalId": "..." }`; if an approval expires, is stale, or has been used, run a new preview.
 
 Pi payload limit variables and defaults are:
 
