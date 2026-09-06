@@ -29,6 +29,27 @@ test('README documents Pi write registration separately from read-only execution
   expect(readme).not.toContain('and `CONFLUENCE_READ_ONLY` is false, Pi also registers');
 });
 
+test('README documents canonical Pi tools and batch actions', () => {
+  const readme = fs.readFileSync(path.join(packageRoot, 'README.md'), 'utf8');
+
+  expect(readme).toContain('confluence_page_read');
+  expect(readme).toContain('CONFLUENCE_PI_BULK_ACTIONS=true');
+  expect(readme).toContain('confluence_pages_batch');
+  expect(readme).toContain('confluence_comments_batch');
+  expect(readme).not.toContain('legacy names remain available');
+});
+
+test('README documents only the canonical Pi API and bulk-actions gate', () => {
+  const readme = fs.readFileSync(path.join(packageRoot, 'README.md'), 'utf8');
+
+  expect(readme).toContain('confluence_page_read');
+  expect(readme).toContain('confluence_pages_batch');
+  expect(readme).toContain('CONFLUENCE_PI_BULK_ACTIONS=true');
+  expect(readme).not.toContain('confluence_pages_manipulate');
+  expect(readme).not.toContain('CONFLUENCE_PI_BULK_PAGE_MANIPULATION');
+  expect(readme).not.toContain('legacy names remain available');
+});
+
 test('includes Pi resources in the npm package tarball', () => {
   const packed = JSON.parse(execFileSync('npm', ['pack', '--dry-run', '--json'], {
     cwd: packageRoot,

@@ -4,6 +4,7 @@ const {
   getOperation,
   listToolNames,
   buildArgs,
+  CANONICAL_TO_LEGACY,
 } = require('../lib/pi/operation-policy');
 
 const READ_TOOLS = [
@@ -221,8 +222,13 @@ const CASES = [
 ];
 
 test('lists the exact allowed tool surface', () => {
-  expect(listToolNames({ includeWrites: false })).toEqual(READ_TOOLS);
-  expect(listToolNames({ includeWrites: true })).toEqual([...READ_TOOLS, ...WRITE_TOOLS]);
+  const names = (legacyNames) => legacyNames.map((legacyName) => (
+    Object.entries(CANONICAL_TO_LEGACY).find(([, value]) => value === legacyName)?.[0]
+  ));
+  expect(listToolNames({ includeWrites: false })).toEqual(names(READ_TOOLS));
+  expect(listToolNames({ includeWrites: true })).toEqual(names([...READ_TOOLS, ...WRITE_TOOLS]));
+  expect(Object.values(CANONICAL_TO_LEGACY)).toEqual(expect.arrayContaining([...READ_TOOLS, ...WRITE_TOOLS]));
+  expect(Object.keys(CANONICAL_TO_LEGACY)).toHaveLength(29);
   expect(OPERATIONS.confluence_api).toBeUndefined();
   expect(() => getOperation('confluence_api')).toThrow(/not allowed/i);
   expect(() => buildArgs('confluence_api', {})).toThrow(/not allowed/i);
@@ -232,6 +238,16 @@ test('lists the exact allowed tool surface', () => {
     READ: 'read', WRITE: 'write', DESTRUCTIVE: 'destructive',
     BULK_PREVIEW: 'bulk-preview', BULK_WRITE: 'bulk-write',
   });
+});
+
+test('canonical names resolve to the legacy operation and reject unknown names', () => {
+  expect(getOperation('confluence_page_create')).toBe(getOperation('confluence_create'));
+  expect(listToolNames({ includeWrites: true })).not.toContain('confluence_create');
+  expect(getOperation('confluence_page_create').toolName).toBe('confluence_create');
+  expect(getOperation('confluence_page_delete').risk).toBe(RISK.DESTRUCTIVE);
+  expect(buildArgs('confluence_page_create', { title: 'Page', spaceKey: 'ENG', content: 'body' }))
+    .toEqual(buildArgs('confluence_create', { title: 'Page', spaceKey: 'ENG', content: 'body' }));
+  expect(() => getOperation('confluence_page_raw')).toThrow(/not allowed/i);
 });
 
 test('builds the hidden direct space lookup operation without registering a Pi tool', () => {

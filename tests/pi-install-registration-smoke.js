@@ -64,11 +64,21 @@ function inventory(extensionModule, extensionEnv) {
       CONFLUENCE_PI_WRITE_SPACES: 'ENG',
       CONFLUENCE_PI_MAX_BODY_BYTES: 'invalid',
     });
+    const bulkActions = inventory(extensionModule, {
+      CONFLUENCE_PI_WRITES: 'true',
+      CONFLUENCE_PI_WRITE_SPACES: 'ENG',
+      CONFLUENCE_PI_BULK_ACTIONS: 'true',
+    });
 
     assert.equal(readOnly.length, 13);
     assert.equal(protectedWrites.length, 29);
+    assert.equal(bulkActions.length, 31);
+    assert.ok(readOnly.includes('confluence_page_read'));
+    assert.ok(!readOnly.includes('confluence_read'));
+    assert.ok(bulkActions.includes('confluence_pages_batch'));
+    assert.ok(bulkActions.includes('confluence_comments_batch'));
     assert.ok(!protectedWrites.includes('confluence_api'));
-    process.stdout.write(`${JSON.stringify({ installed: true, readTools: readOnly.length, protectedTools: protectedWrites.length, apiEscape: false })}\n`);
+    process.stdout.write(`${JSON.stringify({ installed: true, readTools: readOnly.length, protectedTools: protectedWrites.length, bulkTools: bulkActions.length, apiEscape: false })}\n`);
   } finally {
     fs.rmSync(agentDir, { recursive: true, force: true });
   }

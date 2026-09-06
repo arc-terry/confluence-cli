@@ -23,12 +23,20 @@ const BULK_WRITE_TOOLS = [
   'confluence_copy_tree_preview', 'confluence_copy_tree',
   'confluence_versions_purge_preview', 'confluence_versions_purge',
 ];
+const PAGE_BATCH_TOOL = 'confluence_pages_batch';
+const COMMENT_BATCH_TOOL = 'confluence_comments_batch';
 
 const VALID_WRITE_ENV = Object.freeze({
   CONFLUENCE_PI_WRITES: 'true',
   CONFLUENCE_PI_WRITE_SPACES: 'ENG',
   CONFLUENCE_READ_ONLY: 'false',
 });
+
+const { CANONICAL_TO_LEGACY } = require('../lib/pi/operation-policy');
+const LEGACY_TO_CANONICAL = Object.fromEntries(
+  Object.entries(CANONICAL_TO_LEGACY).map(([canonical, legacy]) => [legacy, canonical]),
+);
+const registeredToolNames = (legacyNames) => legacyNames.map((legacyName) => LEGACY_TO_CANONICAL[legacyName]);
 
 const CHILD_HARNESS = String.raw`
 import path from 'node:path';
@@ -38,13 +46,16 @@ import { createJiti } from 'jiti';
 const scenario = JSON.parse(process.env.PI_EXTENSION_SCENARIO || '{}');
 const ordinaryWriteTools = new Set(${JSON.stringify(ORDINARY_WRITE_TOOLS)});
 const bulkWriteTools = new Set(${JSON.stringify(BULK_WRITE_TOOLS)});
-const allWriteTools = new Set([...ordinaryWriteTools, ...bulkWriteTools]);
+const allWriteTools = new Set([...ordinaryWriteTools, ...bulkWriteTools, ${JSON.stringify(PAGE_BATCH_TOOL)}, ${JSON.stringify(COMMENT_BATCH_TOOL)}]);
+const legacyToCanonical = ${JSON.stringify(LEGACY_TO_CANONICAL)};
 const events = [];
 const calls = [];
 const env = { ...(scenario.env || {}) };
 const cwd = scenario.cwd || process.cwd();
 let currentStep = scenario;
 let nowValue = scenario.now ?? 1000;
+const mutationFailures = { ...(scenario.mutationFailures || {}) };
+let activeController;
 
 function setting(name, fallback) {
   if (currentStep && Object.prototype.hasOwnProperty.call(currentStep, name)) return currentStep[name];
@@ -184,9 +195,16 @@ async function runCommand(options) {
   }
 
   events.push('mutation:' + info.toolName + ':' + info.id);
-  if (setting('mutationFails')) {
+  const mutationFailureKey = info.toolName + ':' + info.id;
+  const configuredFailure = mutationFailures[mutationFailureKey];
+  const mutationFailure = Array.isArray(configuredFailure)
+    ? configuredFailure.shift()
+    : typeof configuredFailure === 'number' && configuredFailure > 0
+      ? (mutationFailures[mutationFailureKey] -= 1, {})
+      : configuredFailure;
+  if (mutationFailure || setting('mutationFails')) {
     const error = new Error('Confluence CLI failed: token=' + setting('secret') + ' server rejected update');
-    error.code = setting('mutationErrorCode', 'CLI_FAILED');
+    error.code = mutationFailure?.code || setting('mutationErrorCode', 'CLI_FAILED');
     error.unknownResult = error.code === 'UNKNOWN_RESULT';
     error.stdout = '{"error":"token=' + setting('secret') + ' stdout failure"}';
     error.stderr = 'token=' + setting('secret') + ' stderr failure';
@@ -194,6 +212,9 @@ async function runCommand(options) {
     throw error;
   }
   const json = { ok: true, argv: options.args };
+  if (options.mutation && setting('abortAfterFirstMutation') && events.filter((event) => event.startsWith('mutation:')).length === 1) {
+    activeController.abort();
+  }
   return { stdout: JSON.stringify(json), stderr: 'mutation stderr', truncated: false, json };
 }
 
@@ -238,8 +259,9 @@ function resolveStepInput(input, previousResult) {
 async function executeStep(step, index, previousResult) {
   currentStep = step;
   nowValue = step.now ?? nowValue;
-  const tool = tools.find((candidate) => candidate.name === step.toolName);
+  const tool = tools.find((candidate) => candidate.name === (legacyToCanonical[step.toolName] || step.toolName));
   const controller = new AbortController();
+  activeController = controller;
   if (setting('abortBeforeExecute')) controller.abort();
   const ctx = {
     cwd,
@@ -308,8 +330,8 @@ function hasMutation(output) {
 test('registers exactly thirteen working read tools when writes are not enabled', () => {
   const output = runHarness({ env: { CONFLUENCE_PI_WRITES: '', CONFLUENCE_PI_WRITE_SPACES: '' } });
 
-  expect(output.registered).toEqual(READ_TOOLS);
-  expect(output.writeSchemas).toHaveLength(16);
+  expect(output.registered).toEqual(registeredToolNames(READ_TOOLS));
+  expect(output.writeSchemas).toHaveLength(18);
   expect(output.registered).not.toContain('confluence_create');
   expect(output.registered).not.toContain('confluence_copy_tree_preview');
 });
@@ -317,9 +339,137 @@ test('registers exactly thirteen working read tools when writes are not enabled'
 test('registers exactly sixteen write tools only under a valid write gate', () => {
   const output = runHarness({ env: VALID_WRITE_ENV });
 
-  expect(output.registered).toEqual([...READ_TOOLS, ...ORDINARY_WRITE_TOOLS, ...BULK_WRITE_TOOLS]);
+  expect(output.registered).toEqual(registeredToolNames([...READ_TOOLS, ...ORDINARY_WRITE_TOOLS, ...BULK_WRITE_TOOLS]));
   expect(output.registered).toHaveLength(29);
-  expect(output.writeSchemas).toHaveLength(16);
+  expect(output.writeSchemas).toHaveLength(18);
+});
+
+test('registers canonical resource-action names without legacy aliases', () => {
+  const output = runHarness({ env: VALID_WRITE_ENV });
+
+  expect(output.registered).toEqual(expect.arrayContaining([
+    'confluence_page_read',
+    'confluence_page_create',
+    'confluence_page_comment_create',
+    'confluence_page_tree_copy_preview',
+  ]));
+  expect(output.registered).not.toEqual(expect.arrayContaining([
+    'confluence_read',
+    'confluence_create',
+    'confluence_comment_create',
+    'confluence_copy_tree_preview',
+  ]));
+});
+
+test('page batch requires the bulk-actions gate', () => {
+  expect(runHarness({ env: VALID_WRITE_ENV }).registered).not.toContain(PAGE_BATCH_TOOL);
+  expect(runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+  }).registered).toContain(PAGE_BATCH_TOOL);
+});
+
+test('page batch performs mixed page actions under one confirmation', () => {
+  const output = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: PAGE_BATCH_TOOL,
+    input: { actions: [
+      { operation: 'create', title: 'New', spaceKey: 'ENG', content: 'body' },
+      { operation: 'update', pageId: '123', title: 'Updated' },
+      { operation: 'move', pageId: '123', newParentId: '456' },
+      { operation: 'delete', pageId: '789' },
+    ] },
+    recordInputMessage: true,
+  });
+
+  expect(output.error).toBeNull();
+  expect(output.events.filter((event) => event.startsWith('input-message:'))).toHaveLength(1);
+  expect(output.events.filter((event) => event.startsWith('preflight:'))).toEqual([
+    'preflight:confluence_space_lookup:ENG',
+    'preflight:confluence_info:123',
+    'preflight:confluence_info:123',
+    'preflight:confluence_info:456',
+    'preflight:confluence_info:789',
+  ]);
+  expect(output.result.details.succeeded.map((item) => item.index)).toEqual([0, 1, 2, 3]);
+  expect(output.result.details.cancelled).toBeNull();
+});
+
+test('page batch rejects duplicate canonical delete targets before confirmation', () => {
+  const output = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: PAGE_BATCH_TOOL,
+    input: { actions: [
+      { operation: 'delete', pageId: '123' },
+      { operation: 'delete', pageId: '123' },
+    ] },
+  });
+
+  expect(output.error).toMatchObject({ code: 'INVALID_PAGE_IDS' });
+  expect(output.events.some((event) => event.startsWith('input:'))).toBe(false);
+  expect(hasMutation(output)).toBe(false);
+});
+
+test('comment batch creates multiple comments with one confirmation', () => {
+  const output = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: COMMENT_BATCH_TOOL,
+    input: { actions: [
+      { operation: 'create', pageId: '123', content: 'First' },
+      { operation: 'create', pageId: '789', content: 'Second' },
+    ] },
+    recordInputMessage: true,
+  });
+
+  expect(output.error).toBeNull();
+  expect(output.events.filter((event) => event.startsWith('input-message:'))).toHaveLength(1);
+  expect(output.result.details.succeeded.map((item) => item.index)).toEqual([0, 1]);
+  expect(output.result.details.cancelled).toBeNull();
+});
+
+test('comment batch rejects unsupported actions before confirmation', () => {
+  const output = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: COMMENT_BATCH_TOOL,
+    input: { actions: [{ operation: 'delete', pageId: '123', commentId: '88' }] },
+  });
+
+  expect(output.error).toMatchObject({ code: 'OPERATION_NOT_ALLOWED' });
+  expect(output.events.some((event) => event.startsWith('input:'))).toBe(false);
+});
+
+test('page batch retries known failures, records unknown results, and records later cancellation', () => {
+  const retry = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: PAGE_BATCH_TOOL,
+    input: { actions: [{ operation: 'update', pageId: '123', title: 'Retry' }] },
+    mutationFailures: { 'confluence_update:123': 3 },
+  });
+  expect(retry.events.filter((event) => event === 'mutation:confluence_update:123')).toHaveLength(4);
+  expect(retry.result.details.succeeded.map((item) => item.index)).toEqual([0]);
+
+  const unknown = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: PAGE_BATCH_TOOL,
+    input: { actions: [
+      { operation: 'update', pageId: '123', title: 'Unknown' },
+      { operation: 'delete', pageId: '789' },
+    ] },
+    mutationFailures: { 'confluence_update:123': { code: 'UNKNOWN_RESULT' } },
+  });
+  expect(unknown.events.filter((event) => event === 'mutation:confluence_update:123')).toHaveLength(1);
+  expect(unknown.result.details.unknown.map((item) => item.index)).toEqual([0]);
+  expect(unknown.result.details.succeeded.map((item) => item.index)).toEqual([1]);
+
+  const cancelled = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: PAGE_BATCH_TOOL,
+    input: { actions: [
+      { operation: 'update', pageId: '123', title: 'First' },
+      { operation: 'delete', pageId: '789' },
+    ] },
+    abortAfterFirstMutation: true,
+  });
+  expect(cancelled.result.details.cancelled).toMatchObject({ index: 1, operation: 'confluence_delete' });
 });
 
 test('write schemas match real CLI location values and defer attachment count to runtime limits', () => {
@@ -336,7 +486,7 @@ test('invalid payload limits do not change write registration but fail execution
     input: { pageId: '123', title: 'No mutation' },
   });
 
-  expect(output.registered).toEqual([...READ_TOOLS, ...ORDINARY_WRITE_TOOLS, ...BULK_WRITE_TOOLS]);
+  expect(output.registered).toEqual(registeredToolNames([...READ_TOOLS, ...ORDINARY_WRITE_TOOLS, ...BULK_WRITE_TOOLS]));
   expect(output.error).toMatchObject({ code: 'INVALID_LIMITS' });
   expect(output.calls).toHaveLength(0);
 });
