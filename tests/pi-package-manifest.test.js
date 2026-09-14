@@ -12,12 +12,24 @@ test('declares the bundled Confluence skill and Pi extension', () => {
   });
 });
 
-test('publishes the Pi extension and declares only its runtime peer', () => {
+test('publishes Pi extensions and declares optional runtime peers', () => {
   expect(packageJson.files).toContain('.pi/');
   expect(packageJson.peerDependencies['@earendil-works/pi-coding-agent']).toBeUndefined();
+  expect(packageJson.peerDependencies['@earendil-works/pi-tui']).toBe('*');
   expect(packageJson.peerDependencies.typebox).toBe('*');
+  expect(packageJson.peerDependenciesMeta['@earendil-works/pi-tui']).toEqual({ optional: true });
   expect(packageJson.peerDependenciesMeta.typebox).toEqual({ optional: true });
   expect(fs.existsSync(path.join(__dirname, '../.pi/extensions/confluence-cli.ts'))).toBe(true);
+  expect(fs.existsSync(path.join(__dirname, '../.pi/extensions/confluence-cli/tool-renderer.ts'))).toBe(true);
+  expect(fs.existsSync(path.join(__dirname, '../.pi/extensions/confluence-cli/write-review.ts'))).toBe(true);
+  expect(fs.existsSync(path.join(__dirname, '../.pi/extensions/confluence-cli/batch-action-selector.ts'))).toBe(false);
+});
+
+test('does not expose selector helpers as auto-discovered extensions', () => {
+  const extensionDirectory = path.join(__dirname, '../.pi/extensions');
+  const discovered = fs.readdirSync(extensionDirectory).filter((file) => file.endsWith('.ts'));
+
+  expect(discovered).toEqual(['confluence-cli.ts']);
 });
 
 test('README documents Pi write registration separately from read-only execution blocking', () => {
@@ -29,6 +41,36 @@ test('README documents Pi write registration separately from read-only execution
   expect(readme).not.toContain('and `CONFLUENCE_READ_ONLY` is false, Pi also registers');
 });
 
+test('README documents canonical Pi tools and batch actions', () => {
+  const readme = fs.readFileSync(path.join(packageRoot, 'README.md'), 'utf8');
+
+  expect(readme).toContain('confluence_page_read');
+  expect(readme).toContain('CONFLUENCE_PI_BULK_ACTIONS=true');
+  expect(readme).toContain('confluence_pages_batch');
+  expect(readme).toContain('confluence_comments_batch');
+  expect(readme).not.toContain('legacy names remain available');
+});
+
+test('README documents only the canonical Pi API and bulk-actions gate', () => {
+  const readme = fs.readFileSync(path.join(packageRoot, 'README.md'), 'utf8');
+
+  expect(readme).toContain('confluence_page_read');
+  expect(readme).toContain('confluence_pages_batch');
+  expect(readme).toContain('CONFLUENCE_PI_BULK_ACTIONS=true');
+  expect(readme).not.toContain('confluence_pages_manipulate');
+  expect(readme).not.toContain('CONFLUENCE_PI_BULK_PAGE_MANIPULATION');
+  expect(readme).not.toContain('legacy names remain available');
+});
+
+test('README documents partial batch approval', () => {
+  const readme = fs.readFileSync(path.join(packageRoot, 'README.md'), 'utf8');
+
+  expect(readme).toContain('Space toggles the highlighted action');
+  expect(readme).toContain('MANIPULATE <selected-count> ACTIONS');
+  expect(readme).toContain('RPC confirms the full batch');
+  expect(readme).toContain('skipped');
+});
+
 test('includes Pi resources in the npm package tarball', () => {
   const packed = JSON.parse(execFileSync('npm', ['pack', '--dry-run', '--json'], {
     cwd: packageRoot,
@@ -37,6 +79,8 @@ test('includes Pi resources in the npm package tarball', () => {
   const names = packed[0].files.map((file) => file.path);
   expect(names).toEqual(expect.arrayContaining([
     '.pi/extensions/confluence-cli.ts',
+    '.pi/extensions/confluence-cli/tool-renderer.ts',
+    '.pi/extensions/confluence-cli/write-review.ts',
     'plugins/confluence/skills/confluence/SKILL.md',
     'bin/index.js',
     'lib/pi/command-runner.js',
@@ -45,6 +89,7 @@ test('includes Pi resources in the npm package tarball', () => {
     'lib/pi/preflight.js',
     'lib/pi/preflight-store.js',
   ]));
+  expect(names).not.toContain('.pi/extensions/confluence-cli/batch-action-selector.ts');
   expect(names).not.toContain('lib/pi/read-only-runner.js');
   expect(names).not.toContain('lib/pi/tool-policy.js');
 });

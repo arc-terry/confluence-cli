@@ -23,12 +23,20 @@ const BULK_WRITE_TOOLS = [
   'confluence_copy_tree_preview', 'confluence_copy_tree',
   'confluence_versions_purge_preview', 'confluence_versions_purge',
 ];
+const PAGE_BATCH_TOOL = 'confluence_pages_batch';
+const COMMENT_BATCH_TOOL = 'confluence_comments_batch';
 
 const VALID_WRITE_ENV = Object.freeze({
   CONFLUENCE_PI_WRITES: 'true',
   CONFLUENCE_PI_WRITE_SPACES: 'ENG',
   CONFLUENCE_READ_ONLY: 'false',
 });
+
+const { CANONICAL_TO_LEGACY } = require('../lib/pi/operation-policy');
+const LEGACY_TO_CANONICAL = Object.fromEntries(
+  Object.entries(CANONICAL_TO_LEGACY).map(([canonical, legacy]) => [legacy, canonical]),
+);
+const registeredToolNames = (legacyNames) => legacyNames.map((legacyName) => LEGACY_TO_CANONICAL[legacyName]);
 
 const CHILD_HARNESS = String.raw`
 import path from 'node:path';
@@ -38,13 +46,16 @@ import { createJiti } from 'jiti';
 const scenario = JSON.parse(process.env.PI_EXTENSION_SCENARIO || '{}');
 const ordinaryWriteTools = new Set(${JSON.stringify(ORDINARY_WRITE_TOOLS)});
 const bulkWriteTools = new Set(${JSON.stringify(BULK_WRITE_TOOLS)});
-const allWriteTools = new Set([...ordinaryWriteTools, ...bulkWriteTools]);
+const allWriteTools = new Set([...ordinaryWriteTools, ...bulkWriteTools, ${JSON.stringify(PAGE_BATCH_TOOL)}, ${JSON.stringify(COMMENT_BATCH_TOOL)}]);
+const legacyToCanonical = ${JSON.stringify(LEGACY_TO_CANONICAL)};
 const events = [];
 const calls = [];
 const env = { ...(scenario.env || {}) };
 const cwd = scenario.cwd || process.cwd();
 let currentStep = scenario;
 let nowValue = scenario.now ?? 1000;
+const mutationFailures = { ...(scenario.mutationFailures || {}) };
+let activeController;
 
 function setting(name, fallback) {
   if (currentStep && Object.prototype.hasOwnProperty.call(currentStep, name)) return currentStep[name];
@@ -184,9 +195,16 @@ async function runCommand(options) {
   }
 
   events.push('mutation:' + info.toolName + ':' + info.id);
-  if (setting('mutationFails')) {
+  const mutationFailureKey = info.toolName + ':' + info.id;
+  const configuredFailure = mutationFailures[mutationFailureKey];
+  const mutationFailure = Array.isArray(configuredFailure)
+    ? configuredFailure.shift()
+    : typeof configuredFailure === 'number' && configuredFailure > 0
+      ? (mutationFailures[mutationFailureKey] -= 1, {})
+      : configuredFailure;
+  if (mutationFailure || setting('mutationFails')) {
     const error = new Error('Confluence CLI failed: token=' + setting('secret') + ' server rejected update');
-    error.code = setting('mutationErrorCode', 'CLI_FAILED');
+    error.code = mutationFailure?.code || setting('mutationErrorCode', 'CLI_FAILED');
     error.unknownResult = error.code === 'UNKNOWN_RESULT';
     error.stdout = '{"error":"token=' + setting('secret') + ' stdout failure"}';
     error.stderr = 'token=' + setting('secret') + ' stderr failure';
@@ -194,11 +212,21 @@ async function runCommand(options) {
     throw error;
   }
   const json = { ok: true, argv: options.args };
+  if (options.mutation && setting('abortAfterFirstMutation') && events.filter((event) => event.startsWith('mutation:')).length === 1) {
+    activeController.abort();
+  }
   return { stdout: JSON.stringify(json), stderr: 'mutation stderr', truncated: false, json };
 }
 
 function makeUi(controller) {
   return {
+    async custom() {
+      events.push('custom:batch-selection');
+      if (setting('mutateFileOnSelection')) fs.writeFileSync(setting('mutateFileOnSelection'), 'changed during selection');
+      if (setting('writeSpacesOnSelection')) env.CONFLUENCE_PI_WRITE_SPACES = setting('writeSpacesOnSelection');
+      if (setting('selectedActionIndexes') === '__SPARSE_SELECTION__') return Array(1);
+      return setting('selectedActionIndexes', undefined);
+    },
     async confirm(title, message) {
       events.push('confirm:' + message);
       if (setting('mutateEnvOnConfirm')) env.CONFLUENCE_PI_WRITES = '';
@@ -219,10 +247,39 @@ function makeUi(controller) {
   };
 }
 
+async function reviewWrite(_ctx, options) {
+  events.push('review-open:' + options.title);
+  if (!options.actions) {
+    events.push('review-summary:' + options.summaries.join('\n'));
+    events.push('review-phrase:' + (options.phrase || 'approve'));
+    if (setting('abortInReview')) activeController.abort();
+    if (setting('reviewErrorCode')) throw Object.assign(new Error('Review rejected'), { code: setting('reviewErrorCode') });
+    return {};
+  }
+  const configured = setting('selectedActionIndexes', '__DEFAULT_SELECTION__');
+  const indexes = configured === '__DEFAULT_SELECTION__'
+    ? options.actions.map((item) => item.index)
+    : configured === '__UNDEFINED_SELECTION__'
+      ? undefined
+      : configured === '__SPARSE_SELECTION__'
+        ? Array(1)
+        : configured;
+  if (indexes == null) throw Object.assign(new Error('Write confirmation was cancelled.'), { code: 'CANCELLED' });
+  if (setting('skipReviewPreparation')) return { selectedIndexes: indexes };
+  if (setting('mutateFileOnSelection')) fs.writeFileSync(setting('mutateFileOnSelection'), 'changed during selection');
+  if (setting('writeSpacesOnSelection')) env.CONFLUENCE_PI_WRITE_SPACES = setting('writeSpacesOnSelection');
+  const prepared = await options.prepareSelection(indexes);
+  events.push('review-summary:' + prepared.summaries.join('\n'));
+  events.push('review-phrase:' + prepared.phrase);
+  if (setting('abortInReview')) activeController.abort();
+  if (setting('reviewErrorCode')) throw Object.assign(new Error('Review rejected'), { code: setting('reviewErrorCode') });
+  return { selectedIndexes: setting('approvedActionIndexes', indexes) };
+}
+
 const jiti = createJiti(import.meta.url);
 const extensionModule = await jiti.import(path.resolve(process.cwd(), '.pi/extensions/confluence-cli.ts'));
 const tools = [];
-extensionModule.createConfluenceExtension({ env, runCommand, now: () => nowValue, randomId: () => 'approval-id' })({
+extensionModule.createConfluenceExtension({ env, runCommand, now: () => nowValue, randomId: () => 'approval-id', reviewWrite })({
   registerTool(tool) { tools.push(tool); },
 });
 
@@ -238,11 +295,13 @@ function resolveStepInput(input, previousResult) {
 async function executeStep(step, index, previousResult) {
   currentStep = step;
   nowValue = step.now ?? nowValue;
-  const tool = tools.find((candidate) => candidate.name === step.toolName);
+  const tool = tools.find((candidate) => candidate.name === (legacyToCanonical[step.toolName] || step.toolName));
   const controller = new AbortController();
+  activeController = controller;
   if (setting('abortBeforeExecute')) controller.abort();
   const ctx = {
     cwd,
+    mode: setting('mode', 'rpc'),
     hasUI: setting('hasUI', true) !== false,
     ui: makeUi(controller),
   };
@@ -269,6 +328,11 @@ for (let index = 0; index < steps.length; index += 1) {
 
 process.stdout.write(JSON.stringify({
   registered: tools.map((tool) => tool.name),
+  registeredDefinitions: tools.map((tool) => ({
+    name: tool.name,
+    renderCall: typeof tool.renderCall === 'function',
+    renderResult: typeof tool.renderResult === 'function',
+  })),
   writeSchemas: Object.keys(extensionModule.WRITE_TOOL_SCHEMAS),
   schemaDetails: {
     commentLocations: extensionModule.WRITE_TOOL_SCHEMAS.confluence_comment_create.properties.location.enum,
@@ -308,8 +372,8 @@ function hasMutation(output) {
 test('registers exactly thirteen working read tools when writes are not enabled', () => {
   const output = runHarness({ env: { CONFLUENCE_PI_WRITES: '', CONFLUENCE_PI_WRITE_SPACES: '' } });
 
-  expect(output.registered).toEqual(READ_TOOLS);
-  expect(output.writeSchemas).toHaveLength(16);
+  expect(output.registered).toEqual(registeredToolNames(READ_TOOLS));
+  expect(output.writeSchemas).toHaveLength(18);
   expect(output.registered).not.toContain('confluence_create');
   expect(output.registered).not.toContain('confluence_copy_tree_preview');
 });
@@ -317,9 +381,536 @@ test('registers exactly thirteen working read tools when writes are not enabled'
 test('registers exactly sixteen write tools only under a valid write gate', () => {
   const output = runHarness({ env: VALID_WRITE_ENV });
 
-  expect(output.registered).toEqual([...READ_TOOLS, ...ORDINARY_WRITE_TOOLS, ...BULK_WRITE_TOOLS]);
+  expect(output.registered).toEqual(registeredToolNames([...READ_TOOLS, ...ORDINARY_WRITE_TOOLS, ...BULK_WRITE_TOOLS]));
   expect(output.registered).toHaveLength(29);
-  expect(output.writeSchemas).toHaveLength(16);
+  expect(output.writeSchemas).toHaveLength(18);
+});
+
+test('registers canonical resource-action names without legacy aliases', () => {
+  const output = runHarness({ env: VALID_WRITE_ENV });
+
+  expect(output.registered).toEqual(expect.arrayContaining([
+    'confluence_page_read',
+    'confluence_page_create',
+    'confluence_page_comment_create',
+    'confluence_page_tree_copy_preview',
+  ]));
+  expect(output.registered).not.toEqual(expect.arrayContaining([
+    'confluence_read',
+    'confluence_create',
+    'confluence_comment_create',
+    'confluence_copy_tree_preview',
+  ]));
+});
+
+test('page batch requires the bulk-actions gate', () => {
+  expect(runHarness({ env: VALID_WRITE_ENV }).registered).not.toContain(PAGE_BATCH_TOOL);
+  expect(runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+  }).registered).toContain(PAGE_BATCH_TOOL);
+});
+
+test('render callbacks cover every read registration and every write-gated registration', () => {
+  const reads = runHarness({ env: { CONFLUENCE_PI_WRITES: '', CONFLUENCE_PI_WRITE_SPACES: '' } });
+  const writes = runHarness({ env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' } });
+
+  expect(reads.registeredDefinitions).toHaveLength(13);
+  expect(reads.registeredDefinitions.every((tool) => tool.renderCall && tool.renderResult)).toBe(true);
+  expect(writes.registeredDefinitions).toHaveLength(31);
+  expect(writes.registeredDefinitions.every((tool) => tool.renderCall && tool.renderResult)).toBe(true);
+});
+
+test('TUI ordinary write reviews the preflight before mutation without standard dialogs', () => {
+  const output = runHarness({
+    mode: 'tui',
+    env: VALID_WRITE_ENV,
+    toolName: 'confluence_update',
+    input: { pageId: '123', title: 'Release Notes v2' },
+  });
+
+  expect(output.error).toBeNull();
+  expect(output.events).toEqual([
+    'preflight:confluence_info:123',
+    'review-open:Confluence write confirmation',
+    'review-summary:Update Release Notes (ID: 123, SPACE: ENG); new title: "Release Notes v2"?',
+    'review-phrase:approve',
+    'mutation:confluence_update:123',
+  ]);
+});
+
+test('TUI ordinary destructive write sends its exact phrase to review', () => {
+  const output = runHarness({
+    mode: 'tui',
+    env: VALID_WRITE_ENV,
+    toolName: 'confluence_delete',
+    input: { pageId: '123' },
+  });
+
+  expect(output.events).toContain('review-phrase:DELETE PAGE 123');
+  expect(output.events.some((event) => event.startsWith('confirm:') || event.startsWith('input:'))).toBe(false);
+  expect(hasMutation(output)).toBe(true);
+});
+
+test('TUI copy execution refreshes preflight, reviews, then mutates without standard dialogs', () => {
+  const output = runHarness({
+    mode: 'tui',
+    env: VALID_WRITE_ENV,
+    steps: [
+      { toolName: 'confluence_copy_tree_preview', input: { sourcePageId: '123', targetParentId: '456' } },
+      { toolName: 'confluence_copy_tree', input: { approvalId: '$approvalId' } },
+    ],
+  });
+
+  expect(output.events).toEqual([
+    'preflight:confluence_info:123',
+    'preflight:confluence_info:456',
+    'preflight:confluence_copy_tree_preview:123',
+    'preflight:confluence_info:123',
+    'preflight:confluence_info:456',
+    'preflight:confluence_copy_tree_preview:123',
+    'review-open:Confluence bulk write confirmation',
+    'review-summary:Copy 14 pages from Release Notes (ID: 123, SPACE: ENG) to Operations Runbooks (ID: 456, SPACE: ENG) Planned root title: Release Notes (Copy). [max depth: 10; exclude: none; delay: 100 ms; copy suffix: " (Copy)"]?',
+    'review-phrase:COPY 14 PAGES FROM 123 TO 456',
+    'mutation:confluence_copy_tree:123',
+  ]);
+});
+
+test('TUI version purge execution refreshes preflight, reviews, then mutates without standard dialogs', () => {
+  const output = runHarness({
+    mode: 'tui',
+    env: VALID_WRITE_ENV,
+    steps: [
+      { toolName: 'confluence_versions_purge_preview', input: { pageId: '123' } },
+      { toolName: 'confluence_versions_purge', input: { approvalId: '$approvalId' } },
+    ],
+  });
+
+  expect(output.events).toEqual([
+    'preflight:confluence_info:123',
+    'preflight:confluence_versions:123',
+    'preflight:confluence_info:123',
+    'preflight:confluence_versions:123',
+    'review-open:Confluence bulk write confirmation',
+    'review-summary:Purge 3 versions from Release Notes (ID: 123, SPACE: ENG) [throttle: 0 seconds]?',
+    'review-phrase:PURGE 3 VERSIONS FROM 123',
+    'mutation:confluence_versions_purge:123',
+  ]);
+});
+
+test.each([
+  ['CANCELLED', { reviewErrorCode: 'CANCELLED' }],
+  ['CONFIRMATION_MISMATCH', { reviewErrorCode: 'CONFIRMATION_MISMATCH' }],
+  ['abort', { abortInReview: true }],
+])('TUI ordinary review %s starts no mutation', (_label, reviewPatch) => {
+  const output = runHarness({
+    mode: 'tui',
+    ...reviewPatch,
+    env: VALID_WRITE_ENV,
+    toolName: 'confluence_update',
+    input: { pageId: '123', title: 'Release Notes v2' },
+  });
+
+  expect(output.error).toBeNull();
+  expect(output.result.content[0].text).toContain('No Confluence mutation was started.');
+  expect(hasMutation(output)).toBe(false);
+});
+
+test('RPC confirmation uses standard dialogs and never reviewWrite', () => {
+  const output = runHarness({
+    env: VALID_WRITE_ENV,
+    steps: [
+      { toolName: 'confluence_delete', input: { pageId: '123' } },
+      { toolName: 'confluence_copy_tree_preview', input: { sourcePageId: '123', targetParentId: '456' } },
+      { toolName: 'confluence_copy_tree', input: { approvalId: '$approvalId' } },
+      { toolName: 'confluence_versions_purge_preview', input: { pageId: '123' } },
+      { toolName: 'confluence_versions_purge', input: { approvalId: '$approvalId' } },
+    ],
+  });
+
+  expect(output.events).toEqual(expect.arrayContaining([
+    'input:Type exactly: DELETE PAGE 123',
+    'input:Type exactly: COPY 14 PAGES FROM 123 TO 456',
+    'input:Type exactly: PURGE 3 VERSIONS FROM 123',
+  ]));
+  expect(output.events.some((event) => event.startsWith('review-open:'))).toBe(false);
+});
+
+test.each(['json', 'print'])('%s update with no UI starts no mutation', (mode) => {
+  const output = runHarness({
+    mode,
+    hasUI: false,
+    env: VALID_WRITE_ENV,
+    toolName: 'confluence_update',
+    input: { pageId: '123', title: 'Release Notes v2' },
+  });
+
+  expect(hasMutation(output)).toBe(false);
+  expect(output.result.content[0].text).toContain('No Confluence mutation was started.');
+});
+
+test.each(['tui', 'rpc'])('%s read and preview tools stay non-interactive', (mode) => {
+  const output = runHarness({
+    mode,
+    env: VALID_WRITE_ENV,
+    steps: [
+      { toolName: 'confluence_read', input: { pageId: '123' } },
+      { toolName: 'confluence_copy_tree_preview', input: { sourcePageId: '123', targetParentId: '456' } },
+    ],
+  });
+
+  expect(output.events.some((event) => /^(review-open|confirm|input):/.test(event))).toBe(false);
+});
+
+test('RPC page batch reuses its initial preflights for full-batch confirmation and execution', () => {
+  const output = runHarness({
+    mode: 'rpc',
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: PAGE_BATCH_TOOL,
+    input: { actions: [
+      { operation: 'create', title: 'New', spaceKey: 'ENG', content: 'body' },
+      { operation: 'update', pageId: '123', title: 'Updated' },
+      { operation: 'move', pageId: '123', newParentId: '456' },
+      { operation: 'delete', pageId: '789' },
+    ] },
+    recordInputMessage: true,
+  });
+
+  expect(output.error).toBeNull();
+  expect(output.events).not.toContain('custom:batch-selection');
+  expect(output.events.some((event) => event.startsWith('review-open:'))).toBe(false);
+  expect(output.events.filter((event) => event.startsWith('input-message:'))).toHaveLength(1);
+  expect(output.events.filter((event) => event.startsWith('preflight:'))).toEqual([
+    'preflight:confluence_space_lookup:ENG',
+    'preflight:confluence_info:123',
+    'preflight:confluence_info:123',
+    'preflight:confluence_info:456',
+    'preflight:confluence_info:789',
+  ]);
+  expect(output.result.details.succeeded.map((item) => item.index)).toEqual([0, 1, 2, 3]);
+  expect(output.result.details.cancelled).toBeNull();
+});
+
+test('TUI batch reviews once, re-preflights, and executes only selected actions', () => {
+  const output = runHarness({
+    mode: 'tui',
+    selectedActionIndexes: [0, 2],
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: PAGE_BATCH_TOOL,
+    input: { actions: [
+      { operation: 'create-child', title: 'Page A', parentId: '111', content: 'A' },
+      { operation: 'create-child', title: 'Page B', parentId: '222', content: 'B' },
+      { operation: 'create-child', title: 'Page C', parentId: '333', content: 'C' },
+    ] },
+    recordInputMessage: true,
+  });
+
+  expect(output.events.filter((event) => event.startsWith('review-open:'))).toHaveLength(1);
+  expect(output.events.filter((event) => event.startsWith('preflight:'))).toEqual([
+    'preflight:confluence_info:111',
+    'preflight:confluence_info:222',
+    'preflight:confluence_info:333',
+    'preflight:confluence_info:111',
+    'preflight:confluence_info:333',
+  ]);
+  expect(output.events).toContain('review-phrase:MANIPULATE 2 ACTIONS: 111,333');
+  const finalSummary = output.events.find((event) => event.startsWith('review-summary:'));
+  expect(finalSummary).toContain('Page A');
+  expect(finalSummary).toContain('Page C');
+  expect(finalSummary).not.toContain('Page B');
+  expect(output.events.some((event) => event.startsWith('input:'))).toBe(false);
+  expect(output.events.filter((event) => event.startsWith('mutation:'))).toEqual([
+    'mutation:confluence_create_child:Page A',
+    'mutation:confluence_create_child:Page C',
+  ]);
+  expect(output.result.details.skipped).toEqual([
+    expect.objectContaining({ index: 1, operation: 'confluence_create_child' }),
+  ]);
+});
+
+test.each([
+  ['null', { selectedActionIndexes: null }],
+  ['undefined', { selectedActionIndexes: '__UNDEFINED_SELECTION__' }],
+  ['empty dense array', { selectedActionIndexes: [] }],
+])('TUI batch selection %s returns no mutation without final confirmation', (_label, selection) => {
+  const output = runHarness({
+    mode: 'tui',
+    ...selection,
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: PAGE_BATCH_TOOL,
+    input: { actions: [{ operation: 'delete', pageId: '123' }] },
+  });
+
+  expect(output.result.content[0].text).toContain('No Confluence mutation was started.');
+  expect(output.events.filter((event) => event.startsWith('preflight:'))).toHaveLength(1);
+  expect(output.events.some((event) => event.startsWith('review-phrase:'))).toBe(false);
+  expect(output.events.some((event) => event.startsWith('input:'))).toBe(false);
+  expect(hasMutation(output)).toBe(false);
+});
+
+test.each([
+  ['non-array object', { 0: 0, length: 1 }],
+  ['non-array string', '0'],
+  ['sparse array', '__SPARSE_SELECTION__'],
+  ['null entry', [null]],
+  ['duplicate index', [0, 0]],
+  ['non-integer index', [0.5]],
+  ['unknown index', [1]],
+])('TUI batch rejects malformed selection: %s', (_label, selectedActionIndexes) => {
+  const output = runHarness({
+    mode: 'tui',
+    selectedActionIndexes,
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: PAGE_BATCH_TOOL,
+    input: { actions: [{ operation: 'delete', pageId: '123' }] },
+  });
+
+  expect(output.error).toMatchObject({ code: 'INVALID_SELECTION' });
+  expect(output.events.filter((event) => event.startsWith('preflight:'))).toHaveLength(1);
+  expect(output.events.some((event) => event.startsWith('review-phrase:'))).toBe(false);
+  expect(output.events.some((event) => event.startsWith('input:'))).toBe(false);
+  expect(hasMutation(output)).toBe(false);
+});
+
+test('TUI partial selection requires the selected exact phrase', () => {
+  const output = runHarness({
+    mode: 'tui',
+    selectedActionIndexes: [0, 2],
+    reviewErrorCode: 'CONFIRMATION_MISMATCH',
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: PAGE_BATCH_TOOL,
+    input: { actions: [
+      { operation: 'create-child', title: 'Page A', parentId: '300720018', content: 'A' },
+      { operation: 'create-child', title: 'Page B', parentId: '300720018', content: 'B' },
+      { operation: 'create-child', title: 'Page C', parentId: '300720018', content: 'C' },
+    ] },
+  });
+
+  expect(output.events).toContain('review-phrase:MANIPULATE 2 ACTIONS: 300720018,300720018');
+  expect(output.events.some((event) => event.startsWith('input:'))).toBe(false);
+  expect(hasMutation(output)).toBe(false);
+});
+
+test.each([
+  ['cancel', { reviewErrorCode: 'CANCELLED' }],
+  ['phrase mismatch', { reviewErrorCode: 'CONFIRMATION_MISMATCH' }],
+  ['abort', { abortInReview: true }],
+])('selected batch review %s after preparation starts no mutation', (_label, reviewPatch) => {
+  const output = runHarness({
+    mode: 'tui',
+    selectedActionIndexes: [0],
+    ...reviewPatch,
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: PAGE_BATCH_TOOL,
+    input: { actions: [{ operation: 'delete', pageId: '123' }] },
+  });
+
+  expect(output.error).toBeNull();
+  expect(output.events.filter((event) => event.startsWith('preflight:'))).toHaveLength(2);
+  expect(output.events).toContain('review-phrase:MANIPULATE 1 ACTIONS: 123');
+  expect(output.result.content[0].text).toContain('No Confluence mutation was started.');
+  expect(hasMutation(output)).toBe(false);
+});
+
+test('selected batch rejects approval when review skipped preparation', () => {
+  const output = runHarness({
+    mode: 'tui',
+    selectedActionIndexes: [],
+    skipReviewPreparation: true,
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: PAGE_BATCH_TOOL,
+    input: { actions: [{ operation: 'delete', pageId: '123' }] },
+  });
+
+  expect(output.error).toMatchObject({ code: 'INVALID_SELECTION' });
+  expect(hasMutation(output)).toBe(false);
+});
+
+test('selected batch rejects review approval that differs from the prepared selection', () => {
+  const output = runHarness({
+    mode: 'tui',
+    selectedActionIndexes: [0],
+    approvedActionIndexes: [1],
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: PAGE_BATCH_TOOL,
+    input: { actions: [
+      { operation: 'delete', pageId: '123' },
+      { operation: 'delete', pageId: '789' },
+    ] },
+  });
+
+  expect(output.error).toMatchObject({ code: 'INVALID_SELECTION' });
+  expect(output.events).toContain('review-phrase:MANIPULATE 1 ACTIONS: 123');
+  expect(hasMutation(output)).toBe(false);
+});
+
+test('selected batch rejects a content file changed during integrated review before mutation', () => {
+  const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-selected-file-'));
+  const bodyFile = path.join(projectRoot, 'body.md');
+  fs.writeFileSync(bodyFile, 'before selection');
+
+  try {
+    const output = runHarness({
+      cwd: projectRoot,
+      mode: 'tui',
+      selectedActionIndexes: [0],
+      mutateFileOnSelection: bodyFile,
+      env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+      toolName: PAGE_BATCH_TOOL,
+      input: { actions: [{ operation: 'update', pageId: '123', contentFile: 'body.md' }] },
+    });
+
+    expect(output.error).toMatchObject({ code: 'STALE_PAYLOAD' });
+    expect(output.events.filter((event) => event.startsWith('preflight:'))).toEqual([
+      'preflight:confluence_info:123',
+    ]);
+    expect(output.events.some((event) => event.startsWith('review-phrase:'))).toBe(false);
+    expect(output.events.some((event) => event.startsWith('input:'))).toBe(false);
+    expect(hasMutation(output)).toBe(false);
+  } finally {
+    fs.rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('selected batch rejects an allowlist changed during integrated review before mutation', () => {
+  const output = runHarness({
+    mode: 'tui',
+    selectedActionIndexes: [0],
+    writeSpacesOnSelection: 'OPS',
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: PAGE_BATCH_TOOL,
+    input: { actions: [{ operation: 'update', pageId: '123', title: 'Selected' }] },
+  });
+
+  expect(output.error).toMatchObject({ code: 'SPACE_NOT_ALLOWED' });
+  expect(output.events.filter((event) => event.startsWith('preflight:'))).toEqual([
+    'preflight:confluence_info:123',
+    'preflight:confluence_info:123',
+  ]);
+  expect(output.events.some((event) => event.startsWith('review-phrase:'))).toBe(false);
+  expect(output.events.some((event) => event.startsWith('input:'))).toBe(false);
+  expect(hasMutation(output)).toBe(false);
+});
+
+test('RPC batch confirms and executes the full original batch without custom selection', () => {
+  const output = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: PAGE_BATCH_TOOL,
+    input: { actions: [
+      { operation: 'create-child', title: 'Page A', parentId: '300720018', content: 'A' },
+      { operation: 'create-child', title: 'Page B', parentId: '300720018', content: 'B' },
+    ] },
+  });
+
+  expect(output.events).not.toContain('custom:batch-selection');
+  expect(output.events.some((event) => event.startsWith('review-open:'))).toBe(false);
+  expect(output.events).toContain('input:Type exactly: MANIPULATE 2 ACTIONS: 300720018,300720018');
+  expect(output.events.filter((event) => event.startsWith('mutation:'))).toEqual([
+    'mutation:confluence_create_child:Page A',
+    'mutation:confluence_create_child:Page B',
+  ]);
+});
+
+test('comment batch selection executes the selected comment and reports the other as skipped', () => {
+  const output = runHarness({
+    mode: 'tui',
+    selectedActionIndexes: [1],
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: COMMENT_BATCH_TOOL,
+    input: { actions: [
+      { operation: 'create', pageId: '123', content: 'First' },
+      { operation: 'create', pageId: '789', content: 'Second' },
+    ] },
+  });
+
+  expect(output.events.filter((event) => event.startsWith('review-open:'))).toHaveLength(1);
+  expect(output.events).toContain('review-phrase:MANIPULATE 1 ACTIONS: 789');
+  const summary = output.events.find((event) => event.startsWith('review-summary:'));
+  expect(summary).toContain('789');
+  expect(summary).not.toContain('123');
+  expect(output.events.filter((event) => event.startsWith('mutation:'))).toEqual([
+    'mutation:confluence_comment_create:789',
+  ]);
+  expect(output.result.details.skipped).toEqual([
+    expect.objectContaining({ index: 0, operation: 'confluence_comment_create' }),
+  ]);
+});
+
+test('page batch rejects duplicate canonical delete targets before confirmation', () => {
+  const output = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: PAGE_BATCH_TOOL,
+    input: { actions: [
+      { operation: 'delete', pageId: '123' },
+      { operation: 'delete', pageId: '123' },
+    ] },
+  });
+
+  expect(output.error).toMatchObject({ code: 'INVALID_PAGE_IDS' });
+  expect(output.events.some((event) => event.startsWith('input:'))).toBe(false);
+  expect(hasMutation(output)).toBe(false);
+});
+
+test('comment batch creates multiple comments with one confirmation', () => {
+  const output = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: COMMENT_BATCH_TOOL,
+    input: { actions: [
+      { operation: 'create', pageId: '123', content: 'First' },
+      { operation: 'create', pageId: '789', content: 'Second' },
+    ] },
+    recordInputMessage: true,
+  });
+
+  expect(output.error).toBeNull();
+  expect(output.events.filter((event) => event.startsWith('input-message:'))).toHaveLength(1);
+  expect(output.result.details.succeeded.map((item) => item.index)).toEqual([0, 1]);
+  expect(output.result.details.cancelled).toBeNull();
+});
+
+test('comment batch rejects unsupported actions before confirmation', () => {
+  const output = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: COMMENT_BATCH_TOOL,
+    input: { actions: [{ operation: 'delete', pageId: '123', commentId: '88' }] },
+  });
+
+  expect(output.error).toMatchObject({ code: 'OPERATION_NOT_ALLOWED' });
+  expect(output.events.some((event) => event.startsWith('input:'))).toBe(false);
+});
+
+test('page batch retries known failures, records unknown results, and records later cancellation', () => {
+  const retry = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: PAGE_BATCH_TOOL,
+    input: { actions: [{ operation: 'update', pageId: '123', title: 'Retry' }] },
+    mutationFailures: { 'confluence_update:123': 3 },
+  });
+  expect(retry.events.filter((event) => event === 'mutation:confluence_update:123')).toHaveLength(4);
+  expect(retry.result.details.succeeded.map((item) => item.index)).toEqual([0]);
+
+  const unknown = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: PAGE_BATCH_TOOL,
+    input: { actions: [
+      { operation: 'update', pageId: '123', title: 'Unknown' },
+      { operation: 'delete', pageId: '789' },
+    ] },
+    mutationFailures: { 'confluence_update:123': { code: 'UNKNOWN_RESULT' } },
+  });
+  expect(unknown.events.filter((event) => event === 'mutation:confluence_update:123')).toHaveLength(1);
+  expect(unknown.result.details.unknown.map((item) => item.index)).toEqual([0]);
+  expect(unknown.result.details.succeeded.map((item) => item.index)).toEqual([1]);
+
+  const cancelled = runHarness({
+    env: { ...VALID_WRITE_ENV, CONFLUENCE_PI_BULK_ACTIONS: 'true' },
+    toolName: PAGE_BATCH_TOOL,
+    input: { actions: [
+      { operation: 'update', pageId: '123', title: 'First' },
+      { operation: 'delete', pageId: '789' },
+    ] },
+    abortAfterFirstMutation: true,
+  });
+  expect(cancelled.result.details.cancelled).toMatchObject({ index: 1, operation: 'confluence_delete' });
 });
 
 test('write schemas match real CLI location values and defer attachment count to runtime limits', () => {
@@ -336,7 +927,7 @@ test('invalid payload limits do not change write registration but fail execution
     input: { pageId: '123', title: 'No mutation' },
   });
 
-  expect(output.registered).toEqual([...READ_TOOLS, ...ORDINARY_WRITE_TOOLS, ...BULK_WRITE_TOOLS]);
+  expect(output.registered).toEqual(registeredToolNames([...READ_TOOLS, ...ORDINARY_WRITE_TOOLS, ...BULK_WRITE_TOOLS]));
   expect(output.error).toMatchObject({ code: 'INVALID_LIMITS' });
   expect(output.calls).toHaveLength(0);
 });

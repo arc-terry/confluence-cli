@@ -78,9 +78,26 @@ The package does not persist these values in Pi settings or session files. Chang
 
 Write tool registration depends only on `CONFLUENCE_PI_WRITES=true` plus a valid non-empty `CONFLUENCE_PI_WRITE_SPACES` allowlist. `CONFLUENCE_READ_ONLY=true` does not hide registered write tools; it blocks every write execution even if those tools remain visible.
 
-Pi read tools are: `confluence_read`, `confluence_search`, `confluence_info`, `confluence_spaces`, `confluence_children`, `confluence_export`, `confluence_convert`, `confluence_find`, `confluence_versions`, `confluence_comments`, `confluence_attachments`, `confluence_property_list`, and `confluence_property_get`.
+Pi uses canonical resource-action tool names: `confluence_page_read`, `confluence_pages_search`, `confluence_page_info`, `confluence_spaces_list`, `confluence_page_children_list`, `confluence_page_export`, `confluence_content_convert`, `confluence_page_find`, `confluence_page_versions_list`, `confluence_page_comments_list`, `confluence_page_attachments_list`, `confluence_page_properties_list`, and `confluence_page_property_get`.
 
-When `CONFLUENCE_PI_WRITES=true` and `CONFLUENCE_PI_WRITE_SPACES` is a non-empty comma-separated allowlist without wildcards, Pi also registers these protected mutation tools: `confluence_create`, `confluence_create_child`, `confluence_update`, `confluence_move`, `confluence_delete`, `confluence_copy_tree_preview`, `confluence_copy_tree`, `confluence_comment_create`, `confluence_comment_delete`, `confluence_property_set`, `confluence_property_delete`, `confluence_attachment_upload`, `confluence_attachment_delete`, `confluence_version_delete`, `confluence_versions_purge_preview`, and `confluence_versions_purge`.
+When `CONFLUENCE_PI_WRITES=true` and `CONFLUENCE_PI_WRITE_SPACES` is a non-empty comma-separated allowlist without wildcards, Pi also registers protected canonical mutations such as `confluence_page_create`, `confluence_page_child_create`, `confluence_page_update`, `confluence_page_move`, `confluence_page_delete`, `confluence_page_comment_create`, `confluence_page_attachment_upload`, `confluence_page_tree_copy_preview`, and `confluence_page_tree_copy`. This is a breaking Pi-extension API change; standalone CLI command names are unchanged.
+
+Set `CONFLUENCE_PI_BULK_ACTIONS=true` to additionally register `confluence_pages_batch` and `confluence_comments_batch`. Each batch preflights every action before authorization. In the Pi TUI, every action starts selected: Up/Down moves the highlight, Space toggles the highlighted action, `a` selects or clears all, Enter reviews the selection, and Escape cancels. The final confirmation must exactly match `MANIPULATE <selected-count> ACTIONS: <selected-canonical-scope-tokens>`; selection alone does not authorize writes. An empty selection, cancellation, blank or mismatched confirmation, or abort starts no mutation. Only selected actions execute in input order, and unselected actions are returned under `skipped`. RPC confirms the full batch with its existing exact confirmation because custom TUI selection is unavailable:
+
+```js
+confluence_pages_batch({ actions: [
+  { operation: 'create', title: 'Release Notes', spaceKey: 'ENG', content: 'Draft' },
+  { operation: 'update', pageId: '123', title: 'Release Notes v2' },
+  { operation: 'move', pageId: '123', newParentId: '456' },
+  { operation: 'delete', pageId: '789' },
+] });
+
+confluence_comments_batch({ actions: [
+  { operation: 'create', pageId: '123', content: 'Ready for review.' },
+] });
+```
+
+Page batches support `create`, `create-child`, `update`, `move`, and `delete`; comment batches currently support `create` only.
 
 The generic API escape hatch remains unavailable: this package does not register `confluence_api` or any `api`, `argv`, or raw HTTP method tool. Use the typed tools above rather than model-controlled Bash for supported Confluence operations.
 

@@ -18,17 +18,25 @@ describe('production shrinkwrap generation', () => {
     }
   });
 
-  test('declares TypeBox as the only optional Pi runtime peer', () => {
+  test('declares Pi TUI and TypeBox as optional Pi runtime peers', () => {
     const manifest = require('../package.json');
 
-    expect(manifest.peerDependencies).toEqual({ typebox: '*' });
-    expect(manifest.peerDependenciesMeta).toEqual({ typebox: { optional: true } });
+    expect(manifest.peerDependencies).toEqual({ '@earendil-works/pi-tui': '*', typebox: '*' });
+    expect(manifest.peerDependenciesMeta).toEqual({
+      '@earendil-works/pi-tui': { optional: true },
+      typebox: { optional: true },
+    });
   });
 
-  test('installs TypeBox for Pi extension tests as a development dependency', () => {
+  test('keeps unsupported Pi TUI packages out of Node 18/20 development installs', () => {
     const manifest = require('../package.json');
+    const lock = require('../package-lock.json');
 
+    expect(manifest.devDependencies['@earendil-works/pi-tui']).toBeUndefined();
     expect(manifest.devDependencies.typebox).toBe('^1.3.18');
+    expect(lock.packages['node_modules/@earendil-works/pi-tui']).toBeUndefined();
+    expect(lock.packages['node_modules/get-east-asian-width']).toBeUndefined();
+    expect(lock.packages['node_modules/marked']).toBeUndefined();
   });
 
   test('excludes peer packages from the production shrinkwrap', () => {
